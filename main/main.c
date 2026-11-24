@@ -7,11 +7,13 @@
 #include "actuators.h"
 #include "sensors.h"
 #include "storage.h"
+#include "wifi_tg.h"
 
 static const char *TAG = "MAIN";
 
-#define MQ2_WARMUP_SEC   20
-#define MENU_ITEM_COUNT  6
+#define MQ2_WARMUP_SEC      20
+#define MENU_ITEM_COUNT     6
+#define TG_REPEAT_SEC       60
 
 typedef enum {
     SCR_MAIN = 0,
@@ -104,6 +106,7 @@ void app_main(void)
     sys_config_t cfg;
     storage_load(&cfg);
 
+    wifi_tg_init();
     btn_init();
     actuators_init();
     sensors_init();
@@ -117,17 +120,21 @@ void app_main(void)
     int   test_fan      = 0;
     bool  test_alm      = false;
 
-    bool  fan_on        = false;
-    bool  alarm_temp    = false;
-    bool  alarm_gas     = false;
-    bool  buzzer_muted  = false;
-    bool  blink_state   = false;
-    int   warmup_sec    = MQ2_WARMUP_SEC;
+    bool  fan_on         = false;
+    bool  alarm_temp     = false;
+    bool  alarm_gas      = false;
+    bool  prev_alm_temp  = false;
+    bool  prev_alm_gas   = false;
+    bool  prev_temp_ok   = true;
+    bool  buzzer_muted   = false;
+    bool  blink_state    = false;
+    int   warmup_sec     = MQ2_WARMUP_SEC;
 
-    float temp_c        = 0.0f;
-    bool  temp_ok       = false;
-    int   gas_mv        = 0;
-    char  st_buf[32]    = "WARMUP";
+    float temp_c         = 0.0f;
+    bool  temp_ok        = false;
+    int   gas_mv         = 0;
+    char  st_buf[32]     = "WARMUP";
+    char  tg_buf[220];
 
     lcd_data_t ui = {
         .temp    = 0.0f,
@@ -141,6 +148,7 @@ void app_main(void)
 
     TickType_t last_sensor_tick = xTaskGetTickCount();
     TickType_t last_blink_tick  = xTaskGetTickCount();
+    TickType_t last_tg_tick     = 0;
 
     while (1) {
         TickType_t now = xTaskGetTickCount();
@@ -283,9 +291,39 @@ void app_main(void)
                 }
             }
 
-            ESP_LOGI(TAG, "T=%.1f(%s) | GAS=%dmV | FAN=%d%% | T_ON=%d T_ALM=%d GAS_ALM=%d",
+            bool new_danger = (!temp_ok && prev_temp_ok) ||
+                              (alarm_temp && !prev_alm_temp) ||
+                              (alarm_gas && !prev_alm_gas);
+            bool repeat_danger = (!temp_ok || alarm_temp || alarm_gas) &&
+                                 ((now - last_tg_tick) >= pdMS_TO_TICKS(TG_REPEAT_SEC * 1000));
+
+            if (new_danger || repeat_danger) {
+                last_tg_tick = now;
+                if (!temp_ok) {
+                    snprintf(tg_buf, sizeof(tg_buf),
+                             "[CANH BAO] Mat tin hieu cam bien nhiet DS18B20! Quat dang chay 100%% (SAFE).");
+                } else {
+                    snprintf(tg_buf, sizeof(tg_buf),
+                             "[CANH BAO] %s%s%s | T=%.1fC (Nguong %dC) | Gas=%dmV (Nguong %dmV) | Quat=%d%%",
+                             alarm_temp ? "QUA NHIET" : "",
+                             (alarm_temp && alarm_gas) ? " + " : "",
+                             alarm_gas ? "KHOI/GAS" : "",
+                             temp_c, cfg.temp_alarm, gas_mv, cfg.smoke_alarm, fan_get_percent());
+                }
+                wifi_tg_send_alert(tg_buf);
+            } else if ((prev_alm_temp || prev_alm_gas) && !alarm_temp && !alarm_gas && temp_ok) {
+                snprintf(tg_buf, sizeof(tg_buf),
+                         "[AN TOAN] He thong da tro lai binh thuong (T=%.1fC, Gas=%dmV).", temp_c, gas_mv);
+                wifi_tg_send_alert(tg_buf);
+            }
+
+            prev_alm_temp = alarm_temp;
+            prev_alm_gas  = alarm_gas;
+            prev_temp_ok  = temp_ok;
+
+            ESP_LOGI(TAG, "T=%.1f(%s) | GAS=%dmV | FAN=%d%% | WIFI=%s",
                      temp_c, temp_ok ? "OK" : "ERR", gas_mv, fan_get_percent(),
-                     cfg.temp_fan_on, cfg.temp_alarm, cfg.smoke_alarm);
+                     wifi_tg_is_connected() ? "OK" : "--");
 
             if (screen == SCR_MAIN || screen == SCR_TEST) {
                 need_lcd_update = true;
@@ -315,6 +353,7 @@ void app_main(void)
                 ui.temp_ok = temp_ok;
                 ui.gas_mv  = gas_mv;
                 ui.fan_pct = fan_get_percent();
+                ui.wifi    = wifi_tg_is_connected() ? "OK" : "--";
 
                 if (screen == SCR_TEST) {
                     ui.mode = "TEST";
